@@ -301,7 +301,7 @@ def main_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
     rows.append([KeyboardButton("📊 My hours")])
     if tg_id in ADMIN_IDS:
         rows.append([KeyboardButton("📋 Biweekly report")])
-        rows.append([KeyboardButton("💾 Backup data")])
+        rows.append([KeyboardButton("💾 Backup data"), KeyboardButton("♻️ Restore data")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -874,6 +874,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex("^📊 My hours$"), my_hours))
     app.add_handler(MessageHandler(filters.Regex("^📋 Biweekly report$"), report_button))
     app.add_handler(MessageHandler(filters.Regex("^💾 Backup data$"), backup_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^♻️ Restore data$"), restore_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("report", admin_report_cmd))
     app.add_handler(CommandHandler("employees", employees_cmd))
