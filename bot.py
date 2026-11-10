@@ -328,7 +328,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/manual Name YYYY-MM-DD HH:MM-HH:MM – add a missed shift\n"
             "/dellast Name – delete an employee's most recent punch\n"
             "/remove Name – deactivate an employee\n"
-            "/backup – get a full copy of all data (tap before any bot update)",
+            "/backup – get a full copy of all data (tap before any bot update)\n"
+            "/restore – put a backup file back (send /restore, then the file)",
             reply_markup=main_keyboard(user.id),
         )
         return ConversationHandler.END
@@ -579,6 +580,132 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.remove(tmp_path)
 
 
+def _validate_backup_file(path: str) -> tuple[int, int]:
+    """Open a candidate backup file and return (employees, punches) counts.
+
+    Raises ValueError/sqlite3.Error if it is not a timeclock database.
+    """
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = {
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if not {"employees", "punches"} <= tables:
+            raise ValueError("not a timeclock backup (missing tables)")
+        emp = con.execute("SELECT COUNT(*) FROM employees").fetchone()[0]
+        pun = con.execute("SELECT COUNT(*) FROM punches").fetchone()[0]
+        return emp, pun
+    finally:
+        con.close()
+
+
+async def restore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: start a restore. The actual swap needs the confirm tap."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    context.user_data["awaiting_restore"] = True
+    await update.message.reply_text(
+        "Send the backup file now (the timeclock-backup-....db file from "
+        "your phone or from this chat).\n\n"
+        "⚠️ Restoring REPLACES all current employees and punches with the "
+        "ones in that file. Nothing happens until you tap Confirm."
+    )
+
+
+async def restore_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receive a .db file from an admin who is restoring, then ask to confirm."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    caption = (update.message.caption or "").strip()
+    if not (context.user_data.get("awaiting_restore") or caption.startswith("/restore")):
+        return  # some other file, not for us
+    context.user_data["awaiting_restore"] = False
+    doc = update.message.document
+    context.user_data["restore_file_id"] = doc.file_id
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "♻️ Yes, replace everything", callback_data="restore_confirm"
+                ),
+                InlineKeyboardButton("Cancel", callback_data="restore_cancel"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"Restore from “{doc.file_name or 'backup file'}”? "
+        "Current data will be replaced (you will first get a safety copy "
+        "of the current data in this chat).",
+        reply_markup=kb,
+    )
+
+
+async def restore_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id not in ADMIN_IDS:
+        return
+    if query.data == "restore_cancel":
+        context.user_data.pop("restore_file_id", None)
+        await query.edit_message_text("Restore cancelled. Nothing changed.")
+        return
+
+    file_id = context.user_data.pop("restore_file_id", None)
+    if not file_id:
+        await query.edit_message_text(
+            "That restore request expired. Send /restore and the file again."
+        )
+        return
+
+    tmp_path = None
+    staging = DB_PATH + ".restore-tmp"
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".db", prefix="timeclock-restore-"
+        ) as tmp:
+            tmp_path = tmp.name
+        await tg_file.download_to_drive(tmp_path)
+
+        emp, pun = _validate_backup_file(tmp_path)
+
+        # Safety first: send the admin a copy of the CURRENT data before
+        # replacing it, so a wrong-file restore is still recoverable.
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, "rb") as fh:
+                await context.bot.send_document(
+                    chat_id=query.from_user.id,
+                    document=fh,
+                    filename=f"timeclock-before-restore-{now().strftime('%Y-%m-%d-%H%M')}.db",
+                    caption="Safety copy of the data as it was right before this restore.",
+                )
+
+        # Atomic swap: stage next to the live file, then rename over it.
+        with open(tmp_path, "rb") as src, open(staging, "wb") as dst:
+            dst.write(src.read())
+        os.replace(staging, DB_PATH)
+
+        await query.edit_message_text(
+            f"✅ Restored. The bot now has {emp} employees and {pun} punches "
+            "from that backup file."
+        )
+    except Exception:
+        log.exception("Restore failed")
+        await query.edit_message_text(
+            "Restore failed, current data was NOT changed. "
+            "Check the file is a real timeclock backup and try again."
+        )
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if os.path.exists(staging):
+            os.remove(staging)
+
+
 async def employees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -739,6 +866,9 @@ def main() -> None:
     )
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(approval_button, pattern="^(approve|deny):"))
+    app.add_handler(CallbackQueryHandler(restore_button, pattern="^restore_(confirm|cancel)$"))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, restore_document))
     app.add_handler(MessageHandler(filters.Regex("^🟢 Punch in$"), punch_in))
     app.add_handler(MessageHandler(filters.Regex("^🔴 Punch out$"), punch_out))
     app.add_handler(MessageHandler(filters.Regex("^📊 My hours$"), my_hours))
