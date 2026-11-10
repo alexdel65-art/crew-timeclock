@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: crew-timeclock
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: PAY_ANCHOR
+        value: 2026-09-28
+      - key: TZ
+        value: America/Toronto
