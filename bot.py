@@ -19,6 +19,7 @@ import io
 import logging
 import os
 import sqlite3
+import tempfile
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -300,6 +301,7 @@ def main_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
     rows.append([KeyboardButton("📊 My hours")])
     if tg_id in ADMIN_IDS:
         rows.append([KeyboardButton("📋 Biweekly report")])
+        rows.append([KeyboardButton("💾 Backup data")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
@@ -325,7 +327,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/employees – list crew\n"
             "/manual Name YYYY-MM-DD HH:MM-HH:MM – add a missed shift\n"
             "/dellast Name – delete an employee's most recent punch\n"
-            "/remove Name – deactivate an employee",
+            "/remove Name – deactivate an employee\n"
+            "/backup – get a full copy of all data (tap before any bot update)",
             reply_markup=main_keyboard(user.id),
         )
         return ConversationHandler.END
@@ -532,6 +535,50 @@ async def report_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_report_to_admins(context)
 
 
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: send a full snapshot of the database as a file.
+
+    The snapshot uses SQLite's backup API, so it is consistent even if
+    someone punches at the same moment. Save the file somewhere safe:
+    before any bot update, tap Backup first; if the hosted copy is ever
+    lost, this file is what restores every employee and punch.
+    """
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    stamp = now().strftime("%Y-%m-%d-%H%M")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".db", prefix="timeclock-backup-"
+        ) as tmp:
+            tmp_path = tmp.name
+        src = db()
+        try:
+            dst = sqlite3.connect(tmp_path)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        with open(tmp_path, "rb") as fh:
+            await update.message.reply_document(
+                document=fh,
+                filename=f"timeclock-backup-{stamp}.db",
+                caption=(
+                    "Full backup of all employees and punches. "
+                    "Save this file. If the bot's data is ever lost, "
+                    "send this file to Muse to restore it."
+                ),
+            )
+    except Exception:
+        log.exception("Backup failed")
+        await update.message.reply_text("Backup failed. Try again in a minute.")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 async def employees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -696,6 +743,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex("^🔴 Punch out$"), punch_out))
     app.add_handler(MessageHandler(filters.Regex("^📊 My hours$"), my_hours))
     app.add_handler(MessageHandler(filters.Regex("^📋 Biweekly report$"), report_button))
+    app.add_handler(MessageHandler(filters.Regex("^💾 Backup data$"), backup_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("report", admin_report_cmd))
     app.add_handler(CommandHandler("employees", employees_cmd))
     app.add_handler(CommandHandler("manual", manual_cmd))
